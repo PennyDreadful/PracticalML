@@ -1,0 +1,184 @@
+---
+title: "Machine Learning, Har"
+date: "Sunday, April 26, 2015"
+bibliography: bibliography.bib
+output: html_document
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+```{r, loading-libraries, echo=FALSE}
+set.seed(1337)
+library(caret)
+library(randomForest)
+library(plyr)
+library(dplyr)
+library(knitcitations)
+library(RColorBrewer)
+library(gridExtra)
+library(bibtex)
+```
+
+```{r, loading-data, cache=TRUE, echo=FALSE}
+setwd("C:/Studies/MachineLearning1/Project/")
+raw <- read.csv("pml-training.csv", na.strings = c("", "NA", "#DIV/0!"))
+final.test <- read.csv("pml-testing.csv", na.strings = c("", "NA", "#DIV/0!"))
+training.sample <- sample_n(raw, size = 1000)
+in.train = createDataPartition(raw$classe, p = 0.8)[[1]]
+training <- raw[in.train,]
+testing <- raw[-in.train,]
+biblio <- read.bibtex("bibliography.bib")
+```
+
+
+# Abstract
+
+We analyse the weightlifting data from `r citep(biblio[1])` to see if a machine learning algorithm can use data on human motion to predict the weightlifting classe with high accuracy.
+
+# Exploratory analysis
+
+The Human Activity Recognition (HAR) dataset contains motion information taken from various devices (accelerometers, gyroscopes and magnetometers) attached to subjects.  Due to the huge number of types of readings, it's not feasible to manually analyse all the potential predictors.  Instead we consider a pair of variables, pitch of the dumbbell and rolling of the belt, since these variables will clearly be dependent on the type of activity performed.
+
+```{r, exploratory-plot}
+ggplot(training) + geom_point(aes(x = pitch_dumbbell, y = roll_belt, colour = classe))
+```
+
+It is immediately obvious from this plot that the points associated with each value of the classe variable are strongly dependent on the belt roll.  We can also see that there is a high degree of clustering.  Decision trees are trained by finding values of predictors that split the dataset into (largely) homogenous categories, so clustered data lends itself to decision tree prediction.  This suggests that Random Forests (RF), Tree Bagging or a related tree training algorithm will give good results.
+
+# Pruning Data
+
+First we analyse the dataset to see if some predictor variables have more missing values than others
+
+```{r, counting-nas}
+percent.na <- apply(training, 2, function(x) mean(is.na(x)))
+length(percent.na[percent.na < 0.5])
+```
+
+From this we see that, of the original `r ncol(training)` variables, only `r length(percent.na[percent.na < 0.5])` have less than 50% of their values missing.  We can see that all of those `r length(percent.na[percent.na < 0.5])` variables have 0 NA values.  The names of the complete variables are:
+
+```{r}
+names(training[, percent.na == 0])
+```
+
+From this we see that the complete variables are the raw data and, therefore, the incomplete data must be derived values.  Rather than attempting to fill in the missing values, we simply remove those features from the data set.  Since we are keeping the raw data we are not discarding any information by doing this, though we need to show that the raw data are good predictors.
+
+```{r, removing-nas}
+training.na.rm <- training[, percent.na == 0]
+training.sample.na.rm <- training.sample[, percent.na == 0]
+testing.na.rm <- testing[, percent.na == 0]
+```
+
+The first 7 variables do not contain any information on accelerometer readings, and should not have any predictive power[^1].  However, one of those 7 is the name of the user performing the movements.  Different people may perform the movements in different ways, so this is a potential source of bias.  It is unclear how account for this bias, since we do not know anything about the subjects, so we have to hope that they are a representative sample of the population and have few systematic biases.
+
+[^1]: The time variables will be predictive, but only within this particular dataset.  This is simply because each exercise occured within a particular time frame, so if all you knew was the time that would be sufficient to identify the exercise.  Not so for future exercises.
+
+As a result we remove the first 7 variables from the data set.  We also remove the final column, since this contains the variable that we are trying to predict.
+
+```{r, selecting-predictors}
+training.predictors <- training.na.rm[, 8:(ncol(training.na.rm)-1)]
+training.sample.predictors <- training.sample.na.rm[, 8:(ncol(training.sample.na.rm)-1)] 
+testing.predictors <- testing.na.rm[, 8:(ncol(training.na.rm)-1)]
+```
+
+
+In order to be a useful predictor, a variable must not be constant throughout the dataset.  As such, we look for predictors that are predominantly constant throughout the dataset.
+
+```{r}
+nsv <- nearZeroVar(training.predictors, saveMetrics = F)
+sum(nsv)
+```
+
+For this dataset, all of the predictors vary sufficiently, so this doesn't justify removing any predictors.
+
+## Principle Component Analysis
+
+
+As a preprocessing step we consider principle component analysis (PCA).  This reduces the effective number of predictors needed, by rotating to a basis in which all the variables are uncorrelated, ordering the new basis by the amount of variance found in each variable and discarding variables with insufficient variance.  This procedure should be most effective when there are a large number of highly correlated variables.
+
+```{r, analysising-correlation}
+cor.mat <- cor(training.predictors, training.predictors)
+cor.mat.no.diag <- cor.mat - diag(nrow = nrow(cor.mat), ncol = nrow(cor.mat))
+sum(cor.mat.no.diag > 0.9)
+correlated.rows <- apply(cor.mat.no.diag, 1, function(x) {sum(x > 0.9) > 0})
+cor.mat[correlated.rows, correlated.rows]
+
+plot1 <- ggplot(training.predictors) + geom_point(aes(x=roll_belt, y=total_accel_belt, colour = training$classe, alpha=1/10)) + scale_colour_brewer( type = "div" , palette = "Set1" )
+plot2 <- ggplot(training.predictors) + geom_point(aes(x=log(gyros_dumbbell_z + 2.5), y=log(gyros_forearm_z + 8.1), colour = training$classe, alpha=1/10)) + scale_colour_brewer( type = "div" , palette = "Set1" )
+grid.arrange(plot1, plot2)
+```
+
+We see from this that there are several highly correlated variables. However, while the belt measurements are have a high correlation, the clusters of classe values do not vary in an obvious way along the correlation line. Also, the correlation is as high as it is because the variables are primarily in two large, but distant, clusters.  The gyro data is harder to interpret, but again it does not appear that a single variable will be easily rotated out.
+
+In order to test this, we compare a Random Forest algorithm with PCA to one without.  To minimise overfitting, we employ k-fold cross-validation and select the model that has the highest accuracy score in the cross-validation step.
+
+First with PCA:
+```{r, rf-pca}
+preProc <- preProcess(training.sample.predictors, method = c("scale", "pca"))
+trainPC <- predict(preProc, training.sample.predictors)
+modelFit <- train(training.sample$classe ~., method = "rf", data = trainPC, trControl = trainControl(method = "cv"))
+modelFit$results$Accuracy[1]
+```
+and then without:
+```{r, rf-no-pca}
+preProc <- preProcess(training.sample.predictors, method = c("scale"))
+trainPP <- predict(preProc, training.sample.predictors)
+modelFit <- train(training.sample$classe ~., method = "rf", data = trainPP, trControl = trainControl(method = "cv"))
+modelFit$results$Accuracy[1]
+```
+
+We can see that PCA does cause a noticeable drop in cross validated accuracy when going from 51 predictors to 25.
+
+```{r, rf-pca-40}
+preProc <- preProcess(training.sample.predictors, method = c("pca"), pcaComp = 40)
+trainPC <- predict(preProc, training.sample.predictors)
+modelFit <- train(training.sample$classe ~., method = "rf", data = trainPC, trControl = trainControl(method = "cv"))
+modelFit$results$Accuracy[1]
+```
+
+Increasing the components to 40 helps, but is still noticeably lower accuracy than without.  As a result we do not use PCA in our final analysis.
+
+# Comparing Machine Learning Algorithms
+
+Let's try other ML algorithms.  Linear Discriminant Analysis (LDA):
+
+```{r, LDA}
+modelFit <- train(training.sample$classe ~., method = "lda", data = training.sample.predictors, trControl = trainControl(method = "cv"), preProcess = c("center", "scale"))
+modelFit$results$Accuracy
+```
+
+While extremely fast, LDA proves to be equally inaccurate.
+
+Treebagging:
+
+```{r, Treebagging}
+modelFit <- train(training.sample$classe ~., method = "treebag", data = training.sample.predictors, trControl = trainControl(method = "cv"), preProcess = c("center", "scale"))
+modelFit$results$Accuracy
+```
+
+Treebagging does moderately well, but is slower than RF and slightly less accurate.  Finally, while RF is accurate, it is also slow.  In part this is because of the extra validation performed by the caret package.  Now we compare it to the randomForest package, which employs a bootstrap validation scheme.
+
+```{r, rf-sample}
+modelFit <- randomForest(training.sample$classe~., data=training.sample.predictors)
+modelFit
+```
+
+This approach is considerably faster and appears to give comparable accuracy.
+
+This brief survey suggests that RF is a good algorithm.  In the next section we will use it on the full data set to see if it is good enough.
+
+# Prediction
+
+Finally we train a Random Forest and estimate the out of sample error by using it to predict the classification of the test data (which has been untouched until now).
+```{r, rf-full}
+rfFit <- randomForest(training$classe~., data=training.predictors)
+confusionMatrix(testing$classe, predict(rfFit, testing.predictors))
+```
+
+This approach yielded excellent accuracy and confirms that machine learning with Random Forests is a good way to classify weightlifting mistakes from motion data.
+
+
+```{r, bibliography}
+bibliography()
+```
